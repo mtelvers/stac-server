@@ -75,7 +75,7 @@ let landing_page ~base_url =
 let conformance =
   `Assoc [ ("conformsTo", `List (List.map (fun c -> `String c) conformance_classes)) ]
 
-let collection ~base_url ~year ~tile_count =
+let collection ~base_url ~year ~tile_count ~store_names =
   let year_s = string_of_int year in
   let id = "geotessera-" ^ year_s in
   `Assoc
@@ -120,6 +120,7 @@ let collection ~base_url ~year ~tile_count =
             ("embedding_dimensions", `List [ `Int 128 ]);
             ("sample_resolution_meters", `List [ `Int 10 ]);
             ("tile_count", `Int tile_count);
+            ("stores", `List (List.map (fun s -> `String s) store_names));
           ] );
       ( "links",
         `List
@@ -142,10 +143,10 @@ let collection ~base_url ~year ~tile_count =
           ] );
     ]
 
-let collections_response ~base_url ~years ~tile_counts =
+let collections_response ~base_url ~years ~tile_counts ~store_names =
   let colls =
     List.map2
-      (fun year count -> collection ~base_url ~year ~tile_count:count)
+      (fun year count -> collection ~base_url ~year ~tile_count:count ~store_names)
       years tile_counts
   in
   `Assoc

@@ -4,14 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GeoTessera STAC Browser</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css" />
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
         .container { display: flex; height: 100vh; }
         .sidebar { width: 380px; background: #f5f5f5; overflow-y: auto; border-right: 1px solid #ddd; }
-        .map-container { flex: 1; position: relative; }
-        #map { height: 100%; }
+        .map-container { flex: 1; position: relative; background: radial-gradient(ellipse at center, #0a1028 0%, #02030a 70%); }
+        #map { height: 100%; background: transparent; }
+        .maplibregl-canvas { outline: none; }
         .header { background: #2c3e50; color: white; padding: 20px; }
         .header h1 { font-size: 1.4em; margin-bottom: 5px; }
         .header p { opacity: 0.8; font-size: 0.85em; }
@@ -66,6 +67,14 @@
             </div>
 
             <div class="section">
+                <h2>Replication health</h2>
+                <div id="coverage-summary" class="stat-grid">
+                    <div class="stat"><div class="stat-value">…</div><div class="stat-label">Cells with gaps</div></div>
+                    <div class="stat"><div class="stat-value">…</div><div class="stat-label">Fully replicated</div></div>
+                </div>
+            </div>
+
+            <div class="section">
                 <h2>Coverage</h2>
                 <div id="stats" class="stat-grid">
                     <div class="stat"><div class="stat-value">-</div><div class="stat-label">Tiles</div></div>
@@ -91,23 +100,163 @@
             <div class="map-overlay">
                 <span id="view-status">Zoom in to see items</span>
             </div>
+            <div class="map-overlay" style="top: auto; bottom: 30px; right: 10px;">
+                <div style="font-weight:600;margin-bottom:6px">Replication gaps</div>
+                <div style="display:flex;flex-direction:column;gap:3px;font-size:0.78em">
+                    <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#f1c40f;vertical-align:middle;margin-right:6px"></span>missing from 1 store</div>
+                    <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#e67e22;vertical-align:middle;margin-right:6px"></span>missing from 2 stores</div>
+                    <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#c0392b;vertical-align:middle;margin-right:6px"></span>missing from 3+ stores</div>
+                </div>
+                <div style="font-size:0.7em;color:#888;margin-top:5px">No dot ⇒ fully replicated</div>
+            </div>
         </div>
     </div>
 
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
     <script>
         const API_URL = '/api';
-        const map = L.map('map').setView([30, 0], 2);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '&copy; OpenStreetMap'
-        }).addTo(map);
 
-        const itemLayer = L.layerGroup().addTo(map);
+        const map = new maplibregl.Map({
+            container: 'map',
+            style: {
+                version: 8,
+                projection: { type: 'globe' },
+                sky: {
+                    'atmosphere-blend': ['interpolate', ['linear'], ['zoom'], 0, 1, 5, 1, 7, 0]
+                },
+                glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
+                sources: {
+                    countries: {
+                        type: 'vector',
+                        url: 'https://demotiles.maplibre.org/tiles/tiles.json'
+                    }
+                },
+                layers: [
+                    { id: 'background', type: 'background', paint: { 'background-color': '#02030a' } },
+                    {
+                        id: 'countries-fill',
+                        type: 'fill',
+                        source: 'countries',
+                        'source-layer': 'countries',
+                        paint: {
+                            'fill-color': '#0e1a3a',
+                            'fill-opacity': 0.65
+                        }
+                    },
+                    {
+                        id: 'countries-line',
+                        type: 'line',
+                        source: 'countries',
+                        'source-layer': 'countries',
+                        paint: {
+                            'line-color': '#6fa3ff',
+                            'line-width': 0.4,
+                            'line-opacity': 0.55
+                        }
+                    }
+                ]
+            },
+            center: [10, 25],
+            zoom: 1.2,
+            projection: { type: 'globe' }
+        });
+        map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }));
+
         let currentCollection = null;
         let currentYear = 2024;
         let collections = [];
+        let configuredStores = [];
         let selectedItem = null;
         let loadTimeout = null;
+        const currentFeatures = new Map();
+        let coverageFetchToken = 0;
+        let coverageTotalStores = 0;
+
+        async function loadCoverageRaster() {
+            const token = ++coverageFetchToken;
+            try {
+                const resp = await fetch(`${API_URL}/coverage`);
+                if (token !== coverageFetchToken) return;
+                if (!resp.ok) throw new Error(`coverage HTTP ${resp.status}`);
+                const totalStores = parseInt(resp.headers.get('X-Total-Stores')) || configuredStores.length;
+                const totalCells = parseInt(resp.headers.get('X-Total-Cells')) || 0;
+                const anomalyCells = parseInt(resp.headers.get('X-Anomaly-Cells')) || 0;
+                coverageTotalStores = totalStores;
+                const raw = new Uint8Array(await resp.arrayBuffer());
+
+                const recordCount = Math.floor(raw.length / 9);
+                const features = new Array(recordCount);
+                const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+                for (let i = 0; i < recordCount; i++) {
+                    const off = i * 9;
+                    const lon = dv.getInt32(off, true) / 1e6;
+                    const lat = dv.getInt32(off + 4, true) / 1e6;
+                    const count = dv.getUint8(off + 8);
+                    features[i] = {
+                        type: 'Feature',
+                        geometry: { type: 'Point', coordinates: [lon, lat] },
+                        properties: { count: count, missing: totalStores - count }
+                    };
+                }
+                const fc = { type: 'FeatureCollection', features: features };
+                console.log(`coverage: ${anomalyCells} anomaly cells / ${totalCells} total across ${totalStores} stores`);
+
+                const summaryEl = document.getElementById('coverage-summary');
+                if (summaryEl) {
+                    const pct = totalCells > 0 ? (100 * (totalCells - anomalyCells) / totalCells).toFixed(2) : '—';
+                    summaryEl.innerHTML = `
+                        <div class="stat">
+                            <div class="stat-value" style="color:${anomalyCells > 0 ? '#e67e22' : '#27ae60'}">${anomalyCells.toLocaleString()}</div>
+                            <div class="stat-label">Cells with gaps</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value">${pct}%</div>
+                            <div class="stat-label">Fully replicated</div>
+                        </div>
+                    `;
+                }
+
+                if (map.getSource('coverage')) {
+                    map.getSource('coverage').setData(fc);
+                } else {
+                    map.addSource('coverage', { type: 'geojson', data: fc });
+                    const colorStep = ['step', ['get', 'missing'],
+                        '#f1c40f',
+                        2, '#e67e22',
+                        3, '#c0392b',
+                        999, '#8e24aa'
+                    ];
+                    const beforeId = map.getLayer('items-fill') ? 'items-fill' : undefined;
+                    map.addLayer({
+                        id: 'coverage-dots',
+                        type: 'circle',
+                        source: 'coverage',
+                        paint: {
+                            'circle-color': colorStep,
+                            'circle-radius': [
+                                'interpolate', ['linear'], ['zoom'],
+                                0, 3,
+                                3, 5,
+                                6, 8,
+                                9, 0
+                            ],
+                            'circle-blur': 0.2,
+                            'circle-opacity': [
+                                'interpolate', ['linear'], ['zoom'],
+                                0, 0.95,
+                                7, 0.95,
+                                8, 0
+                            ],
+                            'circle-stroke-width': 0.5,
+                            'circle-stroke-color': '#ffffff',
+                            'circle-stroke-opacity': 0.3
+                        }
+                    }, beforeId);
+                }
+            } catch (e) {
+                console.error('Failed to load coverage dots:', e);
+            }
+        }
 
         function storeBadge(name) {
             const cls = ['okavango','s3','scaleway'].includes(name) ? name : 'default';
@@ -134,76 +283,101 @@
                 select.onchange = () => {
                     currentCollection = select.value;
                     currentYear = parseInt(currentCollection.split('-').pop());
+                    refreshConfiguredStores();
                     loadStats();
                     updateView();
                 };
                 currentCollection = select.value || collections[0]?.id;
                 currentYear = parseInt(currentCollection.split('-').pop());
+                refreshConfiguredStores();
                 loadStats();
+                loadCoverageRaster();
             } catch (e) {
                 console.error('Failed to load collections:', e);
             }
         }
 
+        function refreshConfiguredStores() {
+            const c = collections.find(c => c.id === currentCollection);
+            configuredStores = (c && c.summaries && Array.isArray(c.summaries.stores))
+                ? c.summaries.stores
+                : [];
+        }
+
         function loadStats() {
             const c = collections.find(c => c.id === currentCollection);
             if (!c) return;
+            const storesHtml = configuredStores.length > 0
+                ? configuredStores.map(storeBadge).join('')
+                : '<span style="color:#999;font-size:0.8em">none configured</span>';
             document.getElementById('stats').innerHTML = `
                 <div class="stat">
                     <div class="stat-value">${c.summaries.tile_count.toLocaleString()}</div>
                     <div class="stat-label">Tiles in ${currentYear}</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-value">${collections.length}</div>
-                    <div class="stat-label">Collections</div>
+                    <div class="stat-value">${configuredStores.length}</div>
+                    <div class="stat-label">Stores</div>
+                </div>
+                <div class="stat" style="grid-column: 1 / -1;">
+                    <div class="stat-label" style="margin-bottom:4px">Configured stores</div>
+                    <div>${storesHtml}</div>
                 </div>
             `;
         }
 
+        function clearItems() {
+            currentFeatures.clear();
+            const src = map.getSource('items');
+            if (src) src.setData({ type: 'FeatureCollection', features: [] });
+        }
+
         async function loadItems() {
-            itemLayer.clearLayers();
             const bounds = map.getBounds();
             const bbox = `${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
 
             try {
-                const url = `${API_URL}/search?bbox=${bbox}&year=${currentYear}&limit=2000`;
+                const url = `${API_URL}/search?bbox=${bbox}&year=${currentYear}&limit=4000`;
                 const response = await fetch(url);
                 const data = await response.json();
 
+                currentFeatures.clear();
                 const tilesHtml = [];
 
+                const totalStores = configuredStores.length;
+
                 for (const feature of data.features) {
-                    const coords = feature.geometry.coordinates[0];
-                    const rectBounds = [
-                        [coords[0][1], coords[0][0]],
-                        [coords[2][1], coords[2][0]]
-                    ];
+                    const assetKeys = Object.keys(feature.assets || {});
+                    const presentStores = configuredStores.filter(s => assetKeys.includes(s));
+                    const missingStores = configuredStores.filter(s => !assetKeys.includes(s));
+                    const frac = totalStores > 0 ? presentStores.length / totalStores : 0;
 
-                    const assetKeys = Object.keys(feature.assets);
-                    const hasAssets = assetKeys.length > 0;
-                    const color = hasAssets ? '#27ae60' : '#95a5a6';
+                    feature.properties = feature.properties || {};
+                    feature.properties.has_assets = assetKeys.length > 0;
+                    feature.properties.present_count = presentStores.length;
+                    feature.properties.total_count = totalStores;
+                    feature.properties.coverage_frac = frac;
+                    feature.properties._stac_id = feature.id;
+                    currentFeatures.set(feature.id, feature);
 
-                    const rect = L.rectangle(rectBounds, {
-                        color: color,
-                        weight: 1,
-                        fillOpacity: 0.3
-                    });
-                    rect.stacItem = feature;
-                    rect.on('click', () => selectItem(feature));
-                    itemLayer.addLayer(rect);
-
-                    const stores = assetKeys.map(k => {
-                        const name = k.split('_')[0];
-                        return storeBadge(name);
-                    }).join('');
+                    const stores = presentStores.map(storeBadge).join('');
+                    const missing = missingStores.map(s =>
+                        `<span class="store-badge ${['okavango','s3','scaleway'].includes(s) ? s : 'default'}" style="opacity:0.35;text-decoration:line-through">${s}</span>`
+                    ).join('');
 
                     tilesHtml.push(`
                         <div class="tile" data-id="${feature.id}" onclick="selectItemById('${feature.id}')">
                             <div class="tile-name">${feature.id}</div>
-                            <div class="tile-meta">${formatBytes(feature.properties.file_size)} ${stores || '<span style="color:#999">no stores</span>'}</div>
+                            <div class="tile-meta">
+                                <span style="font-weight:600;color:#2c3e50">${presentStores.length}/${totalStores}</span>
+                                ${formatBytes(feature.properties.file_size)}
+                                ${stores}${missing}
+                            </div>
                         </div>
                     `);
                 }
+
+                map.getSource('items').setData(data);
 
                 document.getElementById('tile-count').textContent = data.numberReturned;
                 document.getElementById('tiles-list').innerHTML = tilesHtml.length > 0
@@ -224,7 +398,11 @@
         }
 
         function selectItem(feature) {
+            if (selectedItem) {
+                map.setFeatureState({ source: 'items', id: selectedItem.id }, { selected: false });
+            }
             selectedItem = feature;
+            map.setFeatureState({ source: 'items', id: feature.id }, { selected: true });
             const detail = document.getElementById('tile-detail');
             detail.style.display = 'block';
 
@@ -267,11 +445,8 @@
         }
 
         window.selectItemById = function(id) {
-            itemLayer.eachLayer(layer => {
-                if (layer.stacItem && layer.stacItem.id === id) {
-                    selectItem(layer.stacItem);
-                }
-            });
+            const f = currentFeatures.get(id);
+            if (f) selectItem(f);
         };
 
         function updateView() {
@@ -279,7 +454,7 @@
             loadTimeout = setTimeout(() => {
                 const zoom = map.getZoom();
                 if (zoom < 6) {
-                    itemLayer.clearLayers();
+                    clearItems();
                     document.getElementById('tiles-list').innerHTML = '<p class="loading">Zoom in to see individual items</p>';
                     document.getElementById('tile-count').textContent = '-';
                     document.getElementById('view-status').textContent = 'Zoom in to load items';
@@ -289,8 +464,67 @@
             }, 300);
         }
 
-        map.on('moveend', updateView);
-        loadCollections();
+        map.on('load', () => {
+            map.addSource('items', {
+                type: 'geojson',
+                data: { type: 'FeatureCollection', features: [] },
+                promoteId: '_stac_id'
+            });
+
+            const colorExpr = ['case',
+                ['boolean', ['feature-state', 'selected'], false], '#3498db',
+                ['step', ['coalesce', ['get', 'coverage_frac'], 0],
+                    '#8e24aa',
+                    0.001, '#c0392b',
+                    0.33, '#e67e22',
+                    0.66, '#f1c40f',
+                    1, '#27ae60'
+                ]
+            ];
+
+            map.addLayer({
+                id: 'items-fill',
+                type: 'fill',
+                source: 'items',
+                paint: {
+                    'fill-color': colorExpr,
+                    'fill-opacity': [
+                        'case',
+                        ['boolean', ['feature-state', 'selected'], false], 0.55,
+                        0.3
+                    ]
+                }
+            });
+            map.addLayer({
+                id: 'items-line',
+                type: 'line',
+                source: 'items',
+                paint: {
+                    'line-color': colorExpr,
+                    'line-width': [
+                        'case',
+                        ['boolean', ['feature-state', 'selected'], false], 2,
+                        1
+                    ]
+                }
+            });
+
+            map.on('click', 'items-fill', (e) => {
+                if (e.features && e.features[0]) {
+                    const id = e.features[0].id ?? e.features[0].properties._stac_id;
+                    const f = currentFeatures.get(id);
+                    if (f) selectItem(f);
+                }
+            });
+            map.on('mouseenter', 'items-fill', () => { map.getCanvas().style.cursor = 'pointer'; });
+            map.on('mouseleave', 'items-fill', () => { map.getCanvas().style.cursor = ''; });
+
+            loadCollections();
+        });
+
+        map.on('moveend', () => {
+            if (map.getSource('items')) updateView();
+        });
     </script>
 </body>
 </html>

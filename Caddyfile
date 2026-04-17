@@ -1,4 +1,16 @@
 :80 {
+    encode {
+        gzip
+        match {
+            header Content-Type application/octet-stream*
+            header Content-Type application/json*
+            header Content-Type application/geo+json*
+            header Content-Type text/*
+            header Content-Type application/javascript*
+            header Content-Type image/svg+xml*
+        }
+    }
+
     handle /api/* {
         uri strip_prefix /api
         reverse_proxy stac-server:8000
@@ -6,6 +18,7 @@
 
     handle {
         root * /srv
+        header Cache-Control "no-cache, must-revalidate"
         file_server
         try_files {path} /index.html
     }

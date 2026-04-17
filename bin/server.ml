@@ -60,8 +60,81 @@ let handle_landing ~base_url =
 
 let handle_conformance () = Stac_json.conformance |> respond_json
 
-let handle_collections ~base_url reg =
+let handle_coverage reg store_configs _uri =
+  (* Aggregate across all years by the tile's exact SW corner (lon,lat). Emits
+     one 9-byte record per cell where some store is missing the tile in at
+     least one year: i32 lon_mdeg LE, i32 lat_mdeg LE, u8 fully_replicated_count.
+     Coordinates point at the cell centre (SW + 0.05°). *)
+  let store_names = List.map fst store_configs in
+  let num_stores = List.length store_names in
+  let store_tables =
+    List.map
+      (fun name ->
+        Hashtbl.find_opt reg.Registry.stores name
+        |> Option.value ~default:(Hashtbl.create 0))
+      store_names
+  in
+  (* Key each cell by SW corner expressed as microdegrees to avoid float hashing. *)
+  let cells : (int * int, int array) Hashtbl.t =
+    Hashtbl.create (1 lsl 20)
+  in
+  Array.iter
+    (fun (t : Registry.tile) ->
+      let lon_k = int_of_float (Float.round (t.lon *. 1_000_000.)) in
+      let lat_k = int_of_float (Float.round (t.lat *. 1_000_000.)) in
+      let key = (lon_k, lat_k) in
+      let counts =
+        match Hashtbl.find_opt cells key with
+        | Some c -> c
+        | None ->
+            let c = Array.make (num_stores + 1) 0 in
+            Hashtbl.replace cells key c; c
+      in
+      counts.(0) <- counts.(0) + 1;
+      List.iteri
+        (fun i tbl -> if Hashtbl.mem tbl t.id then counts.(i + 1) <- counts.(i + 1) + 1)
+        store_tables)
+    reg.Registry.tiles;
+  let buf = Buffer.create (1 lsl 16) in
+  let total_cells = ref 0 in
+  let anomaly_cells = ref 0 in
+  Hashtbl.iter
+    (fun (lon_k, lat_k) counts ->
+      incr total_cells;
+      let total = counts.(0) in
+      let fully = ref 0 in
+      for i = 1 to num_stores do
+        if counts.(i) = total then incr fully
+      done;
+      if !fully < num_stores then begin
+        incr anomaly_cells;
+        let center_lon_mdeg = lon_k + 50_000 in
+        let center_lat_mdeg = lat_k + 50_000 in
+        Buffer.add_int32_le buf (Int32.of_int center_lon_mdeg);
+        Buffer.add_int32_le buf (Int32.of_int center_lat_mdeg);
+        Buffer.add_char buf (Char.chr !fully)
+      end)
+    cells;
+  let headers =
+    Cohttp.Header.of_list
+      [
+        ("Content-Type", "application/octet-stream");
+        ("Access-Control-Allow-Origin", "*");
+        ("Access-Control-Expose-Headers",
+         "X-Total-Stores,X-Cell-Size-Deg,X-Total-Cells,X-Anomaly-Cells");
+        ("X-Total-Stores", string_of_int num_stores);
+        ("X-Cell-Size-Deg", "0.1");
+        ("X-Total-Cells", string_of_int !total_cells);
+        ("X-Anomaly-Cells", string_of_int !anomaly_cells);
+        ("Cache-Control", "public, max-age=60");
+      ]
+  in
+  Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers
+    ~body:(Buffer.contents buf) ()
+
+let handle_collections ~base_url reg store_configs =
   let years = reg.Registry.years in
+  let store_names = List.map fst store_configs in
   let tile_counts =
     List.map
       (fun year ->
@@ -70,9 +143,9 @@ let handle_collections ~base_url reg =
         |> Seq.fold_left (fun acc _ -> acc + 1) 0)
       years
   in
-  Stac_json.collections_response ~base_url ~years ~tile_counts |> respond_json
+  Stac_json.collections_response ~base_url ~years ~tile_counts ~store_names |> respond_json
 
-let handle_collection ~base_url reg collection_id =
+let handle_collection ~base_url reg store_configs collection_id =
   (* collection_id is like "geotessera-2024" *)
   match String.split_on_char '-' collection_id with
   | _ :: year_s :: _ -> (
@@ -83,7 +156,8 @@ let handle_collection ~base_url reg collection_id =
             |> Seq.filter (fun (t : Registry.tile) -> t.year = year)
             |> Seq.fold_left (fun acc _ -> acc + 1) 0
           in
-          Stac_json.collection ~base_url ~year ~tile_count |> respond_json
+          let store_names = List.map fst store_configs in
+          Stac_json.collection ~base_url ~year ~tile_count ~store_names |> respond_json
       | _ -> respond_not_found ("Collection not found: " ^ collection_id))
   | _ -> respond_not_found ("Collection not found: " ^ collection_id)
 
@@ -198,13 +272,14 @@ let route ~base_url reg store_configs uri =
   match split_path path with
   | [] -> handle_landing ~base_url
   | [ "conformance" ] -> handle_conformance ()
-  | [ "collections" ] -> handle_collections ~base_url reg
-  | [ "collections"; collection_id ] -> handle_collection ~base_url reg collection_id
+  | [ "collections" ] -> handle_collections ~base_url reg store_configs
+  | [ "collections"; collection_id ] -> handle_collection ~base_url reg store_configs collection_id
   | [ "collections"; collection_id; "items" ] ->
       handle_items ~base_url reg store_configs uri collection_id
   | [ "collections"; collection_id; "items"; item_id ] ->
       handle_item ~base_url reg store_configs collection_id item_id
   | [ "search" ] -> handle_search ~base_url reg store_configs uri
+  | [ "coverage" ] -> handle_coverage reg store_configs uri
   | _ -> respond_not_found ("Unknown path: " ^ path)
 
 let make_callback ~base_url reg store_configs _conn req _body =

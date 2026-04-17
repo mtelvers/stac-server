@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeoTessera STAC Browser</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+        .container { display: flex; height: 100vh; }
+        .sidebar { width: 380px; background: #f5f5f5; overflow-y: auto; border-right: 1px solid #ddd; }
+        .map-container { flex: 1; position: relative; }
+        #map { height: 100%; }
+        .header { background: #2c3e50; color: white; padding: 20px; }
+        .header h1 { font-size: 1.4em; margin-bottom: 5px; }
+        .header p { opacity: 0.8; font-size: 0.85em; }
+        .header .stac-badge { display: inline-block; background: #27ae60; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.7em; vertical-align: middle; margin-left: 8px; }
+        .section { padding: 15px; border-bottom: 1px solid #ddd; }
+        .section h2 { font-size: 1em; color: #2c3e50; margin-bottom: 10px; }
+        .controls { display: flex; gap: 10px; align-items: center; }
+        .controls select { padding: 8px; border: 1px solid #ddd; border-radius: 4px; flex: 1; }
+        .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .stat { background: white; padding: 12px; border-radius: 4px; border: 1px solid #ddd; }
+        .stat-value { font-size: 1.4em; font-weight: 600; color: #2c3e50; }
+        .stat-label { font-size: 0.8em; color: #666; }
+        .tile-list { max-height: 300px; overflow-y: auto; }
+        .tile { background: white; border: 1px solid #ddd; border-radius: 4px; padding: 10px; margin-bottom: 8px; cursor: pointer; transition: all 0.2s; }
+        .tile:hover { border-color: #3498db; }
+        .tile.selected { border-color: #3498db; background: #ebf5fb; }
+        .tile-name { font-weight: 600; color: #2c3e50; font-size: 0.9em; }
+        .tile-meta { font-size: 0.8em; color: #666; margin-top: 3px; }
+        .detail { background: white; padding: 12px; border-radius: 4px; }
+        .detail-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #eee; font-size: 0.85em; }
+        .detail-label { color: #666; }
+        .detail-value { font-weight: 500; }
+        .asset-list { margin-top: 8px; }
+        .asset { background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px; padding: 8px; margin-bottom: 6px; }
+        .asset-name { font-weight: 600; font-size: 0.85em; color: #2c3e50; }
+        .asset-href { font-size: 0.75em; color: #3498db; word-break: break-all; }
+        .asset-meta { font-size: 0.75em; color: #666; margin-top: 2px; }
+        .map-overlay { position: absolute; top: 10px; right: 10px; background: white; padding: 10px 15px; border-radius: 4px; box-shadow: 0 2px 10px rgba(0,0,0,0.15); font-size: 0.85em; z-index: 1000; }
+        .loading { color: #666; font-style: italic; }
+        .badge { display: inline-block; background: #3498db; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.75em; }
+        .badge.warning { background: #e67e22; }
+        .store-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; font-weight: 600; margin-right: 3px; }
+        .store-badge.okavango { background: #d5f5e3; color: #1e8449; }
+        .store-badge.s3 { background: #d6eaf8; color: #2471a3; }
+        .store-badge.scaleway { background: #fdebd0; color: #ca6f1e; }
+        .store-badge.default { background: #eee; color: #555; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="header">
+                <h1>GeoTessera <span class="stac-badge">STAC</span></h1>
+                <p>Global Embedding Tile Browser</p>
+            </div>
+
+            <div class="section">
+                <h2>Collection</h2>
+                <div class="controls">
+                    <select id="collection-select"></select>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Coverage</h2>
+                <div id="stats" class="stat-grid">
+                    <div class="stat"><div class="stat-value">-</div><div class="stat-label">Tiles</div></div>
+                    <div class="stat"><div class="stat-value">-</div><div class="stat-label">Collections</div></div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Items in View <span id="tile-count" class="badge">0</span></h2>
+                <div id="tiles-list" class="tile-list">
+                    <p class="loading">Pan/zoom map to load items...</p>
+                </div>
+            </div>
+
+            <div id="tile-detail" class="section" style="display: none;">
+                <h2>Selected Item</h2>
+                <div class="detail" id="detail-content"></div>
+            </div>
+        </div>
+
+        <div class="map-container">
+            <div id="map"></div>
+            <div class="map-overlay">
+                <span id="view-status">Zoom in to see items</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const API_URL = '/api';
+        const map = L.map('map').setView([30, 0], 2);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap'
+        }).addTo(map);
+
+        const itemLayer = L.layerGroup().addTo(map);
+        let currentCollection = null;
+        let currentYear = 2024;
+        let collections = [];
+        let selectedItem = null;
+        let loadTimeout = null;
+
+        function storeBadge(name) {
+            const cls = ['okavango','s3','scaleway'].includes(name) ? name : 'default';
+            return `<span class="store-badge ${cls}">${name}</span>`;
+        }
+
+        function formatBytes(bytes) {
+            if (!bytes) return '0 B';
+            if (bytes > 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+            if (bytes > 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
+            if (bytes > 1e3) return (bytes / 1e3).toFixed(1) + ' KB';
+            return bytes + ' B';
+        }
+
+        async function loadCollections() {
+            try {
+                const response = await fetch(`${API_URL}/collections`);
+                const data = await response.json();
+                collections = data.collections;
+                const select = document.getElementById('collection-select');
+                select.innerHTML = collections.map(c =>
+                    `<option value="${c.id}" ${c.id === 'geotessera-2024' ? 'selected' : ''}>${c.title} (${c.summaries.tile_count.toLocaleString()} tiles)</option>`
+                ).join('');
+                select.onchange = () => {
+                    currentCollection = select.value;
+                    currentYear = parseInt(currentCollection.split('-').pop());
+                    loadStats();
+                    updateView();
+                };
+                currentCollection = select.value || collections[0]?.id;
+                currentYear = parseInt(currentCollection.split('-').pop());
+                loadStats();
+            } catch (e) {
+                console.error('Failed to load collections:', e);
+            }
+        }
+
+        function loadStats() {
+            const c = collections.find(c => c.id === currentCollection);
+            if (!c) return;
+            document.getElementById('stats').innerHTML = `
+                <div class="stat">
+                    <div class="stat-value">${c.summaries.tile_count.toLocaleString()}</div>
+                    <div class="stat-label">Tiles in ${currentYear}</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">${collections.length}</div>
+                    <div class="stat-label">Collections</div>
+                </div>
+            `;
+        }
+
+        async function loadItems() {
+            itemLayer.clearLayers();
+            const bounds = map.getBounds();
+            const bbox = `${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
+
+            try {
+                const url = `${API_URL}/search?bbox=${bbox}&year=${currentYear}&limit=2000`;
+                const response = await fetch(url);
+                const data = await response.json();
+
+                const tilesHtml = [];
+
+                for (const feature of data.features) {
+                    const coords = feature.geometry.coordinates[0];
+                    const rectBounds = [
+                        [coords[0][1], coords[0][0]],
+                        [coords[2][1], coords[2][0]]
+                    ];
+
+                    const assetKeys = Object.keys(feature.assets);
+                    const hasAssets = assetKeys.length > 0;
+                    const color = hasAssets ? '#27ae60' : '#95a5a6';
+
+                    const rect = L.rectangle(rectBounds, {
+                        color: color,
+                        weight: 1,
+                        fillOpacity: 0.3
+                    });
+                    rect.stacItem = feature;
+                    rect.on('click', () => selectItem(feature));
+                    itemLayer.addLayer(rect);
+
+                    const stores = assetKeys.map(k => {
+                        const name = k.split('_')[0];
+                        return storeBadge(name);
+                    }).join('');
+
+                    tilesHtml.push(`
+                        <div class="tile" data-id="${feature.id}" onclick="selectItemById('${feature.id}')">
+                            <div class="tile-name">${feature.id}</div>
+                            <div class="tile-meta">${formatBytes(feature.properties.file_size)} ${stores || '<span style="color:#999">no stores</span>'}</div>
+                        </div>
+                    `);
+                }
+
+                document.getElementById('tile-count').textContent = data.numberReturned;
+                document.getElementById('tiles-list').innerHTML = tilesHtml.length > 0
+                    ? tilesHtml.slice(0, 100).join('') + (tilesHtml.length > 100 ? '<p class="loading">... and more</p>' : '')
+                    : '<p class="loading">No items in view</p>';
+
+                const status = document.getElementById('view-status');
+                if (data.numberMatched > data.numberReturned) {
+                    status.innerHTML = `<span class="badge warning">${data.numberReturned} of ${data.numberMatched.toLocaleString()}</span> Zoom in for more`;
+                } else {
+                    status.textContent = `${data.numberReturned} items loaded`;
+                }
+
+            } catch (e) {
+                console.error('Failed to load items:', e);
+                document.getElementById('tiles-list').innerHTML = '<p class="loading">Error loading items</p>';
+            }
+        }
+
+        function selectItem(feature) {
+            selectedItem = feature;
+            const detail = document.getElementById('tile-detail');
+            detail.style.display = 'block';
+
+            const props = feature.properties;
+            const assets = feature.assets;
+            const assetKeys = Object.keys(assets);
+
+            let assetsHtml = '';
+            if (assetKeys.length > 0) {
+                assetsHtml = '<div class="asset-list"><strong style="font-size:0.85em">Assets:</strong>';
+                for (const key of assetKeys) {
+                    const a = assets[key];
+                    assetsHtml += `
+                        <div class="asset">
+                            <div class="asset-name">${storeBadge(key.split('_')[0])} ${a.title || key}</div>
+                            <div class="asset-href"><a href="${a.href}" target="_blank">${a.href}</a></div>
+                            <div class="asset-meta">
+                                ${a['file:size'] ? formatBytes(a['file:size']) : ''}
+                                ${a['file:checksum'] ? ' &middot; ' + a['file:checksum'].substring(0, 20) + '...' : ''}
+                            </div>
+                        </div>`;
+                }
+                assetsHtml += '</div>';
+            } else {
+                assetsHtml = '<p style="color:#999;font-size:0.85em">No assets registered for this tile</p>';
+            }
+
+            document.getElementById('detail-content').innerHTML = `
+                <div class="detail-row"><span class="detail-label">ID</span><span class="detail-value">${feature.id}</span></div>
+                <div class="detail-row"><span class="detail-label">Collection</span><span class="detail-value">${feature.collection}</span></div>
+                <div class="detail-row"><span class="detail-label">Bbox</span><span class="detail-value">${feature.bbox.map(v => v.toFixed(2)).join(', ')}</span></div>
+                <div class="detail-row"><span class="detail-label">File Size</span><span class="detail-value">${formatBytes(props.file_size)}</span></div>
+                <div class="detail-row"><span class="detail-label">Scales Size</span><span class="detail-value">${formatBytes(props.scales_size)}</span></div>
+                <div class="detail-row"><span class="detail-label">Datetime</span><span class="detail-value">${props.datetime}</span></div>
+                ${assetsHtml}
+                <div style="margin-top:8px;font-size:0.75em">
+                    <a href="${API_URL}/collections/${feature.collection}/items/${feature.id}" target="_blank">View STAC JSON</a>
+                </div>
+            `;
+        }
+
+        window.selectItemById = function(id) {
+            itemLayer.eachLayer(layer => {
+                if (layer.stacItem && layer.stacItem.id === id) {
+                    selectItem(layer.stacItem);
+                }
+            });
+        };
+
+        function updateView() {
+            clearTimeout(loadTimeout);
+            loadTimeout = setTimeout(() => {
+                const zoom = map.getZoom();
+                if (zoom < 6) {
+                    itemLayer.clearLayers();
+                    document.getElementById('tiles-list').innerHTML = '<p class="loading">Zoom in to see individual items</p>';
+                    document.getElementById('tile-count').textContent = '-';
+                    document.getElementById('view-status').textContent = 'Zoom in to load items';
+                } else {
+                    loadItems();
+                }
+            }, 300);
+        }
+
+        map.on('moveend', updateView);
+        loadCollections();
+    </script>
+</body>
+</html>

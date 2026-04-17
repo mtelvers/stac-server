@@ -1,0 +1,3 @@
+(library
+ (name stac_lib)
+ (libraries arrow yojson unix logs logs.fmt fmt))

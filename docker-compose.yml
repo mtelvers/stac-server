@@ -1,0 +1,23 @@
+services:
+  stac-server:
+    build: .
+    environment:
+      - DATA_DIR=/data
+      - PORT=8000
+      - BASE_URL=https://stac.mint.caelum.ci.dev/api
+      - STORES=okavango=https://dl2.geotessera.org/v1/global_0.1_degree_representation;s3=https://tessera-embeddings.s3.us-west-2.amazonaws.com/v1/global_0.1_degree_representation;scaleway=https://dl1.scw.geotessera.org/v1/global_0.1_degree_representation
+    volumes:
+      - ../registry.parquet:/data/okavango.parquet:ro
+      - ./data/s3.parquet:/data/s3.parquet:ro
+      - ./data/scaleway.parquet:/data/scaleway.parquet:ro
+
+  caddy:
+    image: caddy:alpine
+    ports:
+      - "8085:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./index.html:/srv/index.html:ro
+    depends_on:
+      - stac-server
+

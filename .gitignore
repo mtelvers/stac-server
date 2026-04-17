@@ -1,0 +1,5 @@
+_build/
+_opam/
+data/
+*.parquet
+*_listing.txt

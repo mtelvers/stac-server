@@ -1,0 +1,12 @@
+:80 {
+    handle /api/* {
+        uri strip_prefix /api
+        reverse_proxy stac-server:8000
+    }
+
+    handle {
+        root * /srv
+        file_server
+        try_files {path} /index.html
+    }
+}

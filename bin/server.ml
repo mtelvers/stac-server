@@ -92,52 +92,6 @@ let handle_bitmap reg uri =
   Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers
     ~body:(Bytes.to_string buf) ()
 
-let handle_density reg uri =
-  let resolution = get_float_param uri "resolution" ~default:5.0 in
-  let year = get_int_param uri "year" ~default:0 in
-  let grid : (int * int, int) Hashtbl.t = Hashtbl.create (1 lsl 14) in
-  Array.iter
-    (fun (t : Registry.tile) ->
-      if year = 0 || t.year = year then (
-        let lon_k = int_of_float (floor (t.lon /. resolution)) in
-        let lat_k = int_of_float (floor (t.lat /. resolution)) in
-        let key = (lon_k, lat_k) in
-        let count = Hashtbl.find_opt grid key |> Option.value ~default:0 in
-        Hashtbl.replace grid key (count + 1)))
-    reg.Registry.tiles;
-  let max_count =
-    Hashtbl.fold (fun _k count mx -> max count mx) grid 0
-  in
-  let features =
-    Hashtbl.fold
-      (fun (lon_k, lat_k) count acc ->
-        let lon = float_of_int lon_k *. resolution in
-        let lat = float_of_int lat_k *. resolution in
-        `Assoc [
-          ("type", `String "Feature");
-          ("geometry", Stac_json.polygon_geometry lon lat resolution);
-          ("properties", `Assoc [
-            ("count", `Int count);
-            ("max_count", `Int max_count);
-          ])
-        ] :: acc)
-      grid []
-  in
-  let body = Yojson.Safe.to_string
-    (`Assoc [
-      ("type", `String "FeatureCollection");
-      ("features", `List features);
-    ])
-  in
-  let headers =
-    Cohttp.Header.of_list [
-      ("Content-Type", "application/geo+json");
-      ("Access-Control-Allow-Origin", "*");
-      ("Cache-Control", "public, max-age=300");
-    ]
-  in
-  Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers ~body ()
-
 let handle_coverage reg store_configs _uri =
   (* Aggregate across all years by the tile's exact SW corner (lon,lat). Emits
      one 9-byte record per cell where some store is missing the tile in at
@@ -358,7 +312,6 @@ let route ~base_url reg store_configs uri =
       handle_item ~base_url reg store_configs collection_id item_id
   | [ "search" ] -> handle_search ~base_url reg store_configs uri
   | [ "coverage" ] -> handle_coverage reg store_configs uri
-  | [ "density" ] -> handle_density reg uri
   | [ "bitmap" ] -> handle_bitmap reg uri
   | _ -> respond_not_found ("Unknown path: " ^ path)
 

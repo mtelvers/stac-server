@@ -4,15 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GeoTessera STAC Browser</title>
-    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css" />
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; }
         .container { display: flex; height: 100vh; }
-        .sidebar { width: 380px; background: #f5f5f5; overflow-y: auto; border-right: 1px solid #ddd; }
-        .map-container { flex: 1; position: relative; background: radial-gradient(ellipse at center, #0a1028 0%, #02030a 70%); }
-        #map { height: 100%; background: transparent; }
-        .maplibregl-canvas { outline: none; }
+        .sidebar { width: 380px; background: #f5f5f5; overflow-y: auto; border-right: 1px solid #ddd; flex-shrink: 0; }
+        .map-container { flex: 1; position: relative; overflow: hidden; cursor: crosshair; }
+        canvas { display: block; }
         .header { background: #2c3e50; color: white; padding: 20px; }
         .header h1 { font-size: 1.4em; margin-bottom: 5px; }
         .header p { opacity: 0.8; font-size: 0.85em; }
@@ -28,7 +26,6 @@
         .tile-list { max-height: 300px; overflow-y: auto; }
         .tile { background: white; border: 1px solid #ddd; border-radius: 4px; padding: 10px; margin-bottom: 8px; cursor: pointer; transition: all 0.2s; }
         .tile:hover { border-color: #3498db; }
-        .tile.selected { border-color: #3498db; background: #ebf5fb; }
         .tile-name { font-weight: 600; color: #2c3e50; font-size: 0.9em; }
         .tile-meta { font-size: 0.8em; color: #666; margin-top: 3px; }
         .detail { background: white; padding: 12px; border-radius: 4px; }
@@ -40,15 +37,14 @@
         .asset-name { font-weight: 600; font-size: 0.85em; color: #2c3e50; }
         .asset-href { font-size: 0.75em; color: #3498db; word-break: break-all; }
         .asset-meta { font-size: 0.75em; color: #666; margin-top: 2px; }
-        .map-overlay { position: absolute; top: 10px; right: 10px; background: white; padding: 10px 15px; border-radius: 4px; box-shadow: 0 2px 10px rgba(0,0,0,0.15); font-size: 0.85em; z-index: 1000; }
         .loading { color: #666; font-style: italic; }
         .badge { display: inline-block; background: #3498db; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.75em; }
-        .badge.warning { background: #e67e22; }
         .store-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.7em; font-weight: 600; margin-right: 3px; }
         .store-badge.okavango { background: #d5f5e3; color: #1e8449; }
         .store-badge.s3 { background: #d6eaf8; color: #2471a3; }
         .store-badge.scaleway { background: #fdebd0; color: #ca6f1e; }
         .store-badge.default { background: #eee; color: #555; }
+        .coords-overlay { position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,0.6); color: #ccc; padding: 4px 10px; border-radius: 3px; font-size: 0.75em; font-family: monospace; pointer-events: none; }
     </style>
 </head>
 <body>
@@ -67,10 +63,10 @@
             </div>
 
             <div class="section">
-                <h2>Replication health</h2>
+                <h2>Replication Health</h2>
                 <div id="coverage-summary" class="stat-grid">
-                    <div class="stat"><div class="stat-value">…</div><div class="stat-label">Cells with gaps</div></div>
-                    <div class="stat"><div class="stat-value">…</div><div class="stat-label">Fully replicated</div></div>
+                    <div class="stat"><div class="stat-value">&hellip;</div><div class="stat-label">Cells with gaps</div></div>
+                    <div class="stat"><div class="stat-value">&hellip;</div><div class="stat-label">Fully replicated</div></div>
                 </div>
             </div>
 
@@ -78,14 +74,14 @@
                 <h2>Coverage</h2>
                 <div id="stats" class="stat-grid">
                     <div class="stat"><div class="stat-value">-</div><div class="stat-label">Tiles</div></div>
-                    <div class="stat"><div class="stat-value">-</div><div class="stat-label">Collections</div></div>
+                    <div class="stat"><div class="stat-value">-</div><div class="stat-label">Stores</div></div>
                 </div>
             </div>
 
             <div class="section">
                 <h2>Items in View <span id="tile-count" class="badge">0</span></h2>
                 <div id="tiles-list" class="tile-list">
-                    <p class="loading">Pan/zoom map to load items...</p>
+                    <p class="loading">Click a tile on the map to inspect it</p>
                 </div>
             </div>
 
@@ -95,174 +91,162 @@
             </div>
         </div>
 
-        <div class="map-container">
-            <div id="map"></div>
-            <div class="map-overlay">
-                <span id="view-status">Zoom in to see items</span>
-            </div>
-            <div class="map-overlay" style="top: auto; bottom: 30px; right: 10px;">
-                <div style="font-weight:600;margin-bottom:6px">Replication gaps</div>
-                <div style="display:flex;flex-direction:column;gap:3px;font-size:0.78em">
-                    <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#f1c40f;vertical-align:middle;margin-right:6px"></span>missing from 1 store</div>
-                    <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#e67e22;vertical-align:middle;margin-right:6px"></span>missing from 2 stores</div>
-                    <div><span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#c0392b;vertical-align:middle;margin-right:6px"></span>missing from 3+ stores</div>
-                </div>
-                <div style="font-size:0.7em;color:#888;margin-top:5px">No dot ⇒ fully replicated</div>
-            </div>
+        <div class="map-container" id="map-container">
+            <canvas id="map"></canvas>
+            <div class="coords-overlay" id="coords"></div>
         </div>
     </div>
 
-    <script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
     <script>
         const API_URL = '/api';
+        const GRID_W = 3600, GRID_H = 1800;
 
-        const map = new maplibregl.Map({
-            container: 'map',
-            style: {
-                version: 8,
-                projection: { type: 'globe' },
-                sky: {
-                    'atmosphere-blend': ['interpolate', ['linear'], ['zoom'], 0, 1, 5, 1, 7, 0]
-                },
-                glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
-                sources: {
-                    countries: {
-                        type: 'vector',
-                        url: 'https://demotiles.maplibre.org/tiles/tiles.json'
-                    }
-                },
-                layers: [
-                    { id: 'background', type: 'background', paint: { 'background-color': '#02030a' } },
-                    {
-                        id: 'countries-fill',
-                        type: 'fill',
-                        source: 'countries',
-                        'source-layer': 'countries',
-                        paint: {
-                            'fill-color': '#0e1a3a',
-                            'fill-opacity': 0.65
-                        }
-                    },
-                    {
-                        id: 'countries-line',
-                        type: 'line',
-                        source: 'countries',
-                        'source-layer': 'countries',
-                        paint: {
-                            'line-color': '#6fa3ff',
-                            'line-width': 0.4,
-                            'line-opacity': 0.55
-                        }
-                    }
-                ]
-            },
-            center: [10, 25],
-            zoom: 1.2,
-            projection: { type: 'globe' }
-        });
-        map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }));
+        const canvas = document.getElementById('map');
+        const ctx = canvas.getContext('2d');
+        const container = document.getElementById('map-container');
 
+        /* View state: equirectangular viewport in degrees */
+        let viewLon0 = -180, viewLat0 = -90, viewLonSpan = 360, viewLatSpan = 180;
+        let bitmapCanvas = null; /* offscreen canvas, 3600x1800, covers -180,-90 to 180,90 */
+        let bordersGeoJSON = null;
         let currentCollection = null;
         let currentYear = 2024;
         let collections = [];
         let configuredStores = [];
-        let selectedItem = null;
-        let loadTimeout = null;
-        const currentFeatures = new Map();
-        let coverageFetchToken = 0;
-        let coverageTotalStores = 0;
 
-        async function loadCoverageRaster() {
-            const token = ++coverageFetchToken;
+        /* Coordinate transforms */
+        function lonToX(lon) { return (lon - viewLon0) / viewLonSpan * canvas.width; }
+        function latToY(lat) { return (1 - (lat - viewLat0) / viewLatSpan) * canvas.height; }
+        function xToLon(x) { return viewLon0 + (x / canvas.width) * viewLonSpan; }
+        function yToLat(y) { return viewLat0 + (1 - y / canvas.height) * viewLatSpan; }
+
+        function resize() {
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight;
+            render();
+        }
+        window.addEventListener('resize', resize);
+
+        /* Render everything */
+        function render() {
+            ctx.fillStyle = '#1a1a2e';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            renderBitmap();
+            renderBorders();
+        }
+
+        function renderBitmap() {
+            if (!bitmapCanvas) return;
+            /* The bitmap covers -180..180 lon, -90..90 lat (equirectangular).
+               Map bitmap pixel coords to screen coords via the viewport. */
+            const sx = lonToX(-180);
+            const sy = latToY(90);
+            const sw = lonToX(180) - sx;
+            const sh = latToY(-90) - sy;
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(bitmapCanvas, sx, sy, sw, sh);
+        }
+
+        function renderBorders() {
+            if (!bordersGeoJSON) return;
+            ctx.strokeStyle = 'rgba(180, 200, 255, 0.4)';
+            ctx.lineWidth = 0.8;
+            for (const feature of bordersGeoJSON.features) {
+                const geom = feature.geometry;
+                const rings = geom.type === 'Polygon' ? [geom.coordinates]
+                    : geom.type === 'MultiPolygon' ? geom.coordinates : [];
+                for (const polygon of rings) {
+                    for (const ring of polygon) {
+                        ctx.beginPath();
+                        let penDown = false;
+                        for (let i = 0; i < ring.length; i++) {
+                            const x = lonToX(ring[i][0]);
+                            const y = latToY(ring[i][1]);
+                            /* Skip segments that wrap around the antimeridian */
+                            if (i > 0 && Math.abs(ring[i][0] - ring[i-1][0]) > 90) {
+                                ctx.moveTo(x, y);
+                                penDown = true;
+                            } else if (!penDown) {
+                                ctx.moveTo(x, y);
+                                penDown = true;
+                            } else {
+                                ctx.lineTo(x, y);
+                            }
+                        }
+                        ctx.stroke();
+                    }
+                }
+            }
+        }
+
+        /* Data loading */
+        async function loadBitmap() {
+            try {
+                const resp = await fetch(`${API_URL}/bitmap?year=${currentYear}`);
+                if (!resp.ok) return;
+                const raw = new Uint8Array(await resp.arrayBuffer());
+                const rowBytes = Math.ceil(GRID_W / 8);
+
+                const offscreen = document.createElement('canvas');
+                offscreen.width = GRID_W;
+                offscreen.height = GRID_H;
+                const octx = offscreen.getContext('2d');
+                const img = octx.createImageData(GRID_W, GRID_H);
+                const d = img.data;
+
+                for (let y = 0; y < GRID_H; y++) {
+                    for (let x = 0; x < GRID_W; x++) {
+                        const byteIdx = y * rowBytes + (x >> 3);
+                        const bit = (raw[byteIdx] >> (7 - (x & 7))) & 1;
+                        if (bit) {
+                            const px = (y * GRID_W + x) * 4;
+                            d[px] = 39; d[px+1] = 174; d[px+2] = 96; d[px+3] = 200;
+                        }
+                    }
+                }
+                octx.putImageData(img, 0, 0);
+                bitmapCanvas = offscreen;
+                console.log(`bitmap: ${GRID_W}x${GRID_H}, ${raw.length} bytes`);
+                render();
+            } catch (e) { console.error('bitmap:', e); }
+        }
+
+        async function loadBorders() {
+            try {
+                const resp = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-10m.json');
+                const topo = await resp.json();
+                bordersGeoJSON = topojson.feature(topo, topo.objects.countries);
+                render();
+            } catch (e) { console.error('borders:', e); }
+        }
+
+        async function loadReplicationHealth() {
             try {
                 const resp = await fetch(`${API_URL}/coverage`);
-                if (token !== coverageFetchToken) return;
-                if (!resp.ok) throw new Error(`coverage HTTP ${resp.status}`);
+                if (!resp.ok) return;
                 const totalStores = parseInt(resp.headers.get('X-Total-Stores')) || configuredStores.length;
                 const totalCells = parseInt(resp.headers.get('X-Total-Cells')) || 0;
                 const anomalyCells = parseInt(resp.headers.get('X-Anomaly-Cells')) || 0;
-                coverageTotalStores = totalStores;
-                const raw = new Uint8Array(await resp.arrayBuffer());
-
-                const recordCount = Math.floor(raw.length / 9);
-                const features = new Array(recordCount);
-                const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-                for (let i = 0; i < recordCount; i++) {
-                    const off = i * 9;
-                    const lon = dv.getInt32(off, true) / 1e6;
-                    const lat = dv.getInt32(off + 4, true) / 1e6;
-                    const count = dv.getUint8(off + 8);
-                    features[i] = {
-                        type: 'Feature',
-                        geometry: { type: 'Point', coordinates: [lon, lat] },
-                        properties: { count: count, missing: totalStores - count }
-                    };
-                }
-                const fc = { type: 'FeatureCollection', features: features };
-                console.log(`coverage: ${anomalyCells} anomaly cells / ${totalCells} total across ${totalStores} stores`);
-
-                const summaryEl = document.getElementById('coverage-summary');
-                if (summaryEl) {
-                    const pct = totalCells > 0 ? (100 * (totalCells - anomalyCells) / totalCells).toFixed(2) : '—';
-                    summaryEl.innerHTML = `
-                        <div class="stat">
-                            <div class="stat-value" style="color:${anomalyCells > 0 ? '#e67e22' : '#27ae60'}">${anomalyCells.toLocaleString()}</div>
-                            <div class="stat-label">Cells with gaps</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">${pct}%</div>
-                            <div class="stat-label">Fully replicated</div>
-                        </div>
-                    `;
-                }
-
-                if (map.getSource('coverage')) {
-                    map.getSource('coverage').setData(fc);
-                } else {
-                    map.addSource('coverage', { type: 'geojson', data: fc });
-                    const colorStep = ['step', ['get', 'missing'],
-                        '#f1c40f',
-                        2, '#e67e22',
-                        3, '#c0392b',
-                        999, '#8e24aa'
-                    ];
-                    const beforeId = map.getLayer('items-fill') ? 'items-fill' : undefined;
-                    map.addLayer({
-                        id: 'coverage-dots',
-                        type: 'circle',
-                        source: 'coverage',
-                        paint: {
-                            'circle-color': colorStep,
-                            'circle-radius': [
-                                'interpolate', ['linear'], ['zoom'],
-                                0, 3,
-                                3, 5,
-                                6, 8,
-                                9, 0
-                            ],
-                            'circle-blur': 0.2,
-                            'circle-opacity': [
-                                'interpolate', ['linear'], ['zoom'],
-                                0, 0.95,
-                                7, 0.95,
-                                8, 0
-                            ],
-                            'circle-stroke-width': 0.5,
-                            'circle-stroke-color': '#ffffff',
-                            'circle-stroke-opacity': 0.3
-                        }
-                    }, beforeId);
-                }
-            } catch (e) {
-                console.error('Failed to load coverage dots:', e);
-            }
+                await resp.arrayBuffer();
+                const pct = totalCells > 0 ? (100 * (totalCells - anomalyCells) / totalCells).toFixed(2) : '\u2014';
+                document.getElementById('coverage-summary').innerHTML = `
+                    <div class="stat">
+                        <div class="stat-value" style="color:${anomalyCells > 0 ? '#e67e22' : '#27ae60'}">${anomalyCells.toLocaleString()}</div>
+                        <div class="stat-label">Cells with gaps</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value">${pct}%</div>
+                        <div class="stat-label">Fully replicated</div>
+                    </div>
+                `;
+            } catch (e) { console.error('replication:', e); }
         }
 
         function storeBadge(name) {
             const cls = ['okavango','s3','scaleway'].includes(name) ? name : 'default';
             return `<span class="store-badge ${cls}">${name}</span>`;
         }
-
         function formatBytes(bytes) {
             if (!bytes) return '0 B';
             if (bytes > 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
@@ -285,31 +269,28 @@
                     currentYear = parseInt(currentCollection.split('-').pop());
                     refreshConfiguredStores();
                     loadStats();
-                    updateView();
+                    loadBitmap();
                 };
                 currentCollection = select.value || collections[0]?.id;
                 currentYear = parseInt(currentCollection.split('-').pop());
                 refreshConfiguredStores();
                 loadStats();
-                loadCoverageRaster();
-            } catch (e) {
-                console.error('Failed to load collections:', e);
-            }
+                loadReplicationHealth();
+                loadBitmap();
+            } catch (e) { console.error('collections:', e); }
         }
 
         function refreshConfiguredStores() {
             const c = collections.find(c => c.id === currentCollection);
             configuredStores = (c && c.summaries && Array.isArray(c.summaries.stores))
-                ? c.summaries.stores
-                : [];
+                ? c.summaries.stores : [];
         }
 
         function loadStats() {
             const c = collections.find(c => c.id === currentCollection);
             if (!c) return;
             const storesHtml = configuredStores.length > 0
-                ? configuredStores.map(storeBadge).join('')
-                : '<span style="color:#999;font-size:0.8em">none configured</span>';
+                ? configuredStores.map(storeBadge).join('') : '<span style="color:#999;font-size:0.8em">none</span>';
             document.getElementById('stats').innerHTML = `
                 <div class="stat">
                     <div class="stat-value">${c.summaries.tile_count.toLocaleString()}</div>
@@ -326,47 +307,24 @@
             `;
         }
 
-        function clearItems() {
-            currentFeatures.clear();
-            const src = map.getSource('items');
-            if (src) src.setData({ type: 'FeatureCollection', features: [] });
-        }
-
-        async function loadItems() {
-            const bounds = map.getBounds();
-            const bbox = `${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
-
+        async function loadItemsForBbox(minLon, minLat, maxLon, maxLat) {
             try {
-                const url = `${API_URL}/search?bbox=${bbox}&year=${currentYear}&limit=4000`;
-                const response = await fetch(url);
-                const data = await response.json();
-
-                currentFeatures.clear();
-                const tilesHtml = [];
-
+                const bbox = `${minLon},${minLat},${maxLon},${maxLat}`;
+                const resp = await fetch(`${API_URL}/search?bbox=${bbox}&year=${currentYear}&limit=4000`);
+                const data = await resp.json();
                 const totalStores = configuredStores.length;
+                const tilesHtml = [];
 
                 for (const feature of data.features) {
                     const assetKeys = Object.keys(feature.assets || {});
                     const presentStores = configuredStores.filter(s => assetKeys.includes(s));
                     const missingStores = configuredStores.filter(s => !assetKeys.includes(s));
-                    const frac = totalStores > 0 ? presentStores.length / totalStores : 0;
-
-                    feature.properties = feature.properties || {};
-                    feature.properties.has_assets = assetKeys.length > 0;
-                    feature.properties.present_count = presentStores.length;
-                    feature.properties.total_count = totalStores;
-                    feature.properties.coverage_frac = frac;
-                    feature.properties._stac_id = feature.id;
-                    currentFeatures.set(feature.id, feature);
-
                     const stores = presentStores.map(storeBadge).join('');
                     const missing = missingStores.map(s =>
                         `<span class="store-badge ${['okavango','s3','scaleway'].includes(s) ? s : 'default'}" style="opacity:0.35;text-decoration:line-through">${s}</span>`
                     ).join('');
-
                     tilesHtml.push(`
-                        <div class="tile" data-id="${feature.id}" onclick="selectItemById('${feature.id}')">
+                        <div class="tile" onclick="selectItemById('${feature.id}')">
                             <div class="tile-name">${feature.id}</div>
                             <div class="tile-meta">
                                 <span style="font-weight:600;color:#2c3e50">${presentStores.length}/${totalStores}</span>
@@ -377,39 +335,25 @@
                     `);
                 }
 
-                map.getSource('items').setData(data);
-
                 document.getElementById('tile-count').textContent = data.numberReturned;
                 document.getElementById('tiles-list').innerHTML = tilesHtml.length > 0
                     ? tilesHtml.slice(0, 100).join('') + (tilesHtml.length > 100 ? '<p class="loading">... and more</p>' : '')
-                    : '<p class="loading">No items in view</p>';
+                    : '<p class="loading">No items in selection</p>';
 
-                const status = document.getElementById('view-status');
-                if (data.numberMatched > data.numberReturned) {
-                    status.innerHTML = `<span class="badge warning">${data.numberReturned} of ${data.numberMatched.toLocaleString()}</span> Zoom in for more`;
-                } else {
-                    status.textContent = `${data.numberReturned} items loaded`;
-                }
-
+                /* Store for detail clicks */
+                window._lastItems = data.features;
             } catch (e) {
-                console.error('Failed to load items:', e);
+                console.error('items:', e);
                 document.getElementById('tiles-list').innerHTML = '<p class="loading">Error loading items</p>';
             }
         }
 
         function selectItem(feature) {
-            if (selectedItem) {
-                map.setFeatureState({ source: 'items', id: selectedItem.id }, { selected: false });
-            }
-            selectedItem = feature;
-            map.setFeatureState({ source: 'items', id: feature.id }, { selected: true });
             const detail = document.getElementById('tile-detail');
             detail.style.display = 'block';
-
             const props = feature.properties;
             const assets = feature.assets;
             const assetKeys = Object.keys(assets);
-
             let assetsHtml = '';
             if (assetKeys.length > 0) {
                 assetsHtml = '<div class="asset-list"><strong style="font-size:0.85em">Assets:</strong>';
@@ -417,7 +361,7 @@
                     const a = assets[key];
                     assetsHtml += `
                         <div class="asset">
-                            <div class="asset-name">${storeBadge(key.split('_')[0])} ${a.title || key}</div>
+                            <div class="asset-name">${storeBadge(key)} ${a.title || key}</div>
                             <div class="asset-href"><a href="${a.href}" target="_blank">${a.href}</a></div>
                             <div class="asset-meta">
                                 ${a['file:size'] ? formatBytes(a['file:size']) : ''}
@@ -427,16 +371,14 @@
                 }
                 assetsHtml += '</div>';
             } else {
-                assetsHtml = '<p style="color:#999;font-size:0.85em">No assets registered for this tile</p>';
+                assetsHtml = '<p style="color:#999;font-size:0.85em">No assets registered</p>';
             }
-
             document.getElementById('detail-content').innerHTML = `
                 <div class="detail-row"><span class="detail-label">ID</span><span class="detail-value">${feature.id}</span></div>
                 <div class="detail-row"><span class="detail-label">Collection</span><span class="detail-value">${feature.collection}</span></div>
                 <div class="detail-row"><span class="detail-label">Bbox</span><span class="detail-value">${feature.bbox.map(v => v.toFixed(2)).join(', ')}</span></div>
                 <div class="detail-row"><span class="detail-label">File Size</span><span class="detail-value">${formatBytes(props.file_size)}</span></div>
                 <div class="detail-row"><span class="detail-label">Scales Size</span><span class="detail-value">${formatBytes(props.scales_size)}</span></div>
-                <div class="detail-row"><span class="detail-label">Datetime</span><span class="detail-value">${props.datetime}</span></div>
                 ${assetsHtml}
                 <div style="margin-top:8px;font-size:0.75em">
                     <a href="${API_URL}/collections/${feature.collection}/items/${feature.id}" target="_blank">View STAC JSON</a>
@@ -445,86 +387,119 @@
         }
 
         window.selectItemById = function(id) {
-            const f = currentFeatures.get(id);
+            const items = window._lastItems || [];
+            const f = items.find(i => i.id === id);
             if (f) selectItem(f);
         };
 
-        function updateView() {
-            clearTimeout(loadTimeout);
-            loadTimeout = setTimeout(() => {
-                const zoom = map.getZoom();
-                if (zoom < 6) {
-                    clearItems();
-                    document.getElementById('tiles-list').innerHTML = '<p class="loading">Zoom in to see individual items</p>';
-                    document.getElementById('tile-count').textContent = '-';
-                    document.getElementById('view-status').textContent = 'Zoom in to load items';
+        let refreshTimeout = null;
+        function refreshVisibleItems() {
+            clearTimeout(refreshTimeout);
+            refreshTimeout = setTimeout(() => {
+                /* Only auto-load when zoomed in enough (< 30 degrees span) */
+                if (viewLonSpan < 30 && viewLatSpan < 30) {
+                    loadItemsForBbox(viewLon0, viewLat0, viewLon0 + viewLonSpan, viewLat0 + viewLatSpan);
                 } else {
-                    loadItems();
+                    document.getElementById('tiles-list').innerHTML = '<p class="loading">Zoom in to see tile list</p>';
+                    document.getElementById('tile-count').textContent = '-';
                 }
-            }, 300);
+            }, 400);
         }
 
-        map.on('load', () => {
-            map.addSource('items', {
-                type: 'geojson',
-                data: { type: 'FeatureCollection', features: [] },
-                promoteId: '_stac_id'
-            });
+        /* Mouse interaction: drag to pan, click to inspect tile, wheel to zoom, dblclick to reset */
+        let dragStart = null;
+        let dragViewLon0 = 0, dragViewLat0 = 0;
+        let didDrag = false;
 
-            const colorExpr = ['case',
-                ['boolean', ['feature-state', 'selected'], false], '#3498db',
-                ['step', ['coalesce', ['get', 'coverage_frac'], 0],
-                    '#8e24aa',
-                    0.001, '#c0392b',
-                    0.33, '#e67e22',
-                    0.66, '#f1c40f',
-                    1, '#27ae60'
-                ]
-            ];
+        canvas.addEventListener('mousedown', e => {
+            dragStart = { x: e.offsetX, y: e.offsetY };
+            dragViewLon0 = viewLon0;
+            dragViewLat0 = viewLat0;
+            didDrag = false;
+            canvas.style.cursor = 'grabbing';
+        });
+        canvas.addEventListener('mousemove', e => {
+            const lon = xToLon(e.offsetX).toFixed(2);
+            const lat = yToLat(e.offsetY).toFixed(2);
+            document.getElementById('coords').textContent = `${lat}\u00b0, ${lon}\u00b0`;
+            if (dragStart) {
+                const dx = e.offsetX - dragStart.x;
+                const dy = e.offsetY - dragStart.y;
+                if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag = true;
+                const lonPerPx = viewLonSpan / canvas.width;
+                const latPerPx = viewLatSpan / canvas.height;
+                viewLon0 = dragViewLon0 - dx * lonPerPx;
+                viewLat0 = dragViewLat0 + dy * latPerPx;
+                /* Clamp */
+                viewLon0 = Math.max(-180, Math.min(180 - viewLonSpan, viewLon0));
+                viewLat0 = Math.max(-90, Math.min(90 - viewLatSpan, viewLat0));
+                render();
+            }
+        });
+        canvas.addEventListener('mouseup', e => {
+            canvas.style.cursor = 'crosshair';
+            if (!dragStart) return;
+            dragStart = null;
+            if (didDrag) { refreshVisibleItems(); return; }
 
-            map.addLayer({
-                id: 'items-fill',
-                type: 'fill',
-                source: 'items',
-                paint: {
-                    'fill-color': colorExpr,
-                    'fill-opacity': [
-                        'case',
-                        ['boolean', ['feature-state', 'selected'], false], 0.55,
-                        0.3
-                    ]
-                }
-            });
-            map.addLayer({
-                id: 'items-line',
-                type: 'line',
-                source: 'items',
-                paint: {
-                    'line-color': colorExpr,
-                    'line-width': [
-                        'case',
-                        ['boolean', ['feature-state', 'selected'], false], 2,
-                        1
-                    ]
-                }
-            });
+            /* Click (no drag): fetch the tile at this location */
+            const clickLon = xToLon(e.offsetX);
+            const clickLat = yToLat(e.offsetY);
+            /* Snap to tile grid: centres are at *.X5 */
+            const tileLon = (Math.floor(clickLon / 0.1) * 0.1 + 0.05).toFixed(2);
+            const tileLat = (Math.floor(clickLat / 0.1) * 0.1 + 0.05).toFixed(2);
+            const tileId = `${currentYear}_grid_${tileLon}_${tileLat}`;
 
-            map.on('click', 'items-fill', (e) => {
-                if (e.features && e.features[0]) {
-                    const id = e.features[0].id ?? e.features[0].properties._stac_id;
-                    const f = currentFeatures.get(id);
-                    if (f) selectItem(f);
-                }
-            });
-            map.on('mouseenter', 'items-fill', () => { map.getCanvas().style.cursor = 'pointer'; });
-            map.on('mouseleave', 'items-fill', () => { map.getCanvas().style.cursor = ''; });
-
-            loadCollections();
+            fetch(`${API_URL}/collections/geotessera-${currentYear}/items/${tileId}`)
+                .then(r => { if (r.ok) return r.json(); throw new Error('not found'); })
+                .then(feature => {
+                    selectItem(feature);
+                    window._lastItems = [feature];
+                    document.getElementById('tile-count').textContent = '1';
+                    document.getElementById('tiles-list').innerHTML = `
+                        <div class="tile" onclick="selectItemById('${feature.id}')">
+                            <div class="tile-name">${feature.id}</div>
+                            <div class="tile-meta">${formatBytes(feature.properties.file_size)}</div>
+                        </div>`;
+                })
+                .catch(() => {
+                    document.getElementById('tiles-list').innerHTML =
+                        `<p class="loading">No tile at ${tileLat}\u00b0, ${tileLon}\u00b0</p>`;
+                    document.getElementById('tile-detail').style.display = 'none';
+                });
+        });
+        canvas.addEventListener('mouseleave', () => {
+            dragStart = null;
+            canvas.style.cursor = 'crosshair';
+        });
+        canvas.addEventListener('wheel', e => {
+            e.preventDefault();
+            const factor = e.deltaY > 0 ? 1.3 : 0.77;
+            const mouseLon = xToLon(e.offsetX);
+            const mouseLat = yToLat(e.offsetY);
+            const newLonSpan = Math.min(360, viewLonSpan * factor);
+            const newLatSpan = Math.min(180, viewLatSpan * factor);
+            viewLon0 = mouseLon - (mouseLon - viewLon0) / viewLonSpan * newLonSpan;
+            viewLat0 = mouseLat - (mouseLat - viewLat0) / viewLatSpan * newLatSpan;
+            viewLonSpan = newLonSpan;
+            viewLatSpan = newLatSpan;
+            viewLon0 = Math.max(-180, Math.min(180 - viewLonSpan, viewLon0));
+            viewLat0 = Math.max(-90, Math.min(90 - viewLatSpan, viewLat0));
+            render();
+            refreshVisibleItems();
+        }, { passive: false });
+        canvas.addEventListener('dblclick', () => {
+            viewLon0 = -180; viewLat0 = -90; viewLonSpan = 360; viewLatSpan = 180;
+            document.getElementById('tiles-list').innerHTML = '<p class="loading">Click a tile on the map to inspect it</p>';
+            document.getElementById('tile-count').textContent = '0';
+            document.getElementById('tile-detail').style.display = 'none';
+            render();
         });
 
-        map.on('moveend', () => {
-            if (map.getSource('items')) updateView();
-        });
+        /* Init */
+        resize();
+        loadBorders();
+        loadCollections();
     </script>
 </body>
 </html>

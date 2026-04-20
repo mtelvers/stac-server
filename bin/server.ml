@@ -60,6 +60,84 @@ let handle_landing ~base_url =
 
 let handle_conformance () = Stac_json.conformance |> respond_json
 
+let handle_bitmap reg uri =
+  let year = get_int_param uri "year" ~default:0 in
+  (* 3600 x 1800 grid at 0.1-degree resolution, bitpacked *)
+  let width = 3600 and height = 1800 in
+  let row_bytes = (width + 7) / 8 in
+  let buf = Bytes.make (row_bytes * height) '\000' in
+  Array.iter
+    (fun (t : Registry.tile) ->
+      if year = 0 || t.year = year then (
+        (* Coords are tile centres, e.g. -69.45. SW corner = centre - 0.05.
+           Grid: col 0 = lon -180..-179.9, row 0 = lat 89.9..90 *)
+        let x = int_of_float (Float.round ((t.lon -. 0.05 +. 180.0) /. 0.1)) in
+        let y = int_of_float (Float.round ((90.0 -. (t.lat -. 0.05) -. 0.1) /. 0.1)) in
+        if x >= 0 && x < width && y >= 0 && y < height then (
+          let byte_idx = y * row_bytes + (x / 8) in
+          let bit = 1 lsl (7 - (x land 7)) in
+          let old = Char.code (Bytes.get buf byte_idx) in
+          Bytes.set buf byte_idx (Char.chr (old lor bit)))))
+    reg.Registry.tiles;
+  let headers =
+    Cohttp.Header.of_list [
+      ("Content-Type", "application/octet-stream");
+      ("Access-Control-Allow-Origin", "*");
+      ("Access-Control-Expose-Headers", "X-Width,X-Height");
+      ("X-Width", string_of_int width);
+      ("X-Height", string_of_int height);
+      ("Cache-Control", "public, max-age=300");
+    ]
+  in
+  Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers
+    ~body:(Bytes.to_string buf) ()
+
+let handle_density reg uri =
+  let resolution = get_float_param uri "resolution" ~default:5.0 in
+  let year = get_int_param uri "year" ~default:0 in
+  let grid : (int * int, int) Hashtbl.t = Hashtbl.create (1 lsl 14) in
+  Array.iter
+    (fun (t : Registry.tile) ->
+      if year = 0 || t.year = year then (
+        let lon_k = int_of_float (floor (t.lon /. resolution)) in
+        let lat_k = int_of_float (floor (t.lat /. resolution)) in
+        let key = (lon_k, lat_k) in
+        let count = Hashtbl.find_opt grid key |> Option.value ~default:0 in
+        Hashtbl.replace grid key (count + 1)))
+    reg.Registry.tiles;
+  let max_count =
+    Hashtbl.fold (fun _k count mx -> max count mx) grid 0
+  in
+  let features =
+    Hashtbl.fold
+      (fun (lon_k, lat_k) count acc ->
+        let lon = float_of_int lon_k *. resolution in
+        let lat = float_of_int lat_k *. resolution in
+        `Assoc [
+          ("type", `String "Feature");
+          ("geometry", Stac_json.polygon_geometry lon lat resolution);
+          ("properties", `Assoc [
+            ("count", `Int count);
+            ("max_count", `Int max_count);
+          ])
+        ] :: acc)
+      grid []
+  in
+  let body = Yojson.Safe.to_string
+    (`Assoc [
+      ("type", `String "FeatureCollection");
+      ("features", `List features);
+    ])
+  in
+  let headers =
+    Cohttp.Header.of_list [
+      ("Content-Type", "application/geo+json");
+      ("Access-Control-Allow-Origin", "*");
+      ("Cache-Control", "public, max-age=300");
+    ]
+  in
+  Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers ~body ()
+
 let handle_coverage reg store_configs _uri =
   (* Aggregate across all years by the tile's exact SW corner (lon,lat). Emits
      one 9-byte record per cell where some store is missing the tile in at
@@ -280,14 +358,16 @@ let route ~base_url reg store_configs uri =
       handle_item ~base_url reg store_configs collection_id item_id
   | [ "search" ] -> handle_search ~base_url reg store_configs uri
   | [ "coverage" ] -> handle_coverage reg store_configs uri
+  | [ "density" ] -> handle_density reg uri
+  | [ "bitmap" ] -> handle_bitmap reg uri
   | _ -> respond_not_found ("Unknown path: " ^ path)
 
-let make_callback ~base_url reg store_configs _conn req _body =
+let make_callback ~base_url reg_ref store_configs _conn req _body =
   let uri = Cohttp.Request.uri req in
   let meth = Cohttp.Request.meth req in
   Logs.debug (fun m -> m "%s %s" (Cohttp.Code.string_of_method meth) (Uri.path uri));
   match meth with
-  | `GET -> route ~base_url reg store_configs uri
+  | `GET -> route ~base_url !reg_ref store_configs uri
   | `OPTIONS -> respond_options ()
   | _ -> respond_method_not_allowed ()
 
@@ -323,18 +403,49 @@ let () =
     Logs.err (fun m -> m "STORES env var is required (e.g. STORES=okavango=url;s3=url)");
     exit 1);
 
-  (* First store is primary — its parquet becomes the tile index.
-     Other stores are loaded from their own parquet files. *)
   let stores =
     List.map (fun (name, _cfg) -> (name, data_dir ^ "/" ^ name ^ ".parquet")) store_configs
   in
-  let reg = Registry.create ~stores in
+  let reg_ref = ref (Registry.create ~stores) in
 
   Logs.app (fun m -> m "Starting STAC server on port %d" port);
   Logs.app (fun m -> m "Base URL: %s" base_url);
-  Logs.app (fun m -> m "Stores: %s" (Registry.store_names reg |> String.concat ", "));
+  Logs.app (fun m -> m "Stores: %s" (Registry.store_names !reg_ref |> String.concat ", "));
 
-  let callback = make_callback ~base_url reg store_configs in
-  Cohttp_lwt_unix.Server.create ~mode:(`TCP (`Port port))
-    (Cohttp_lwt_unix.Server.make ~callback ())
-  |> Lwt_main.run
+  let get_mtimes () =
+    List.filter_map
+      (fun (_, path) ->
+        try Some (path, (Unix.stat path).Unix.st_mtime)
+        with Unix.Unix_error _ -> None)
+      stores
+  in
+
+  let check_interval =
+    Sys.getenv_opt "RELOAD_INTERVAL" |> Option.map float_of_string_opt
+    |> Option.join |> Option.value ~default:10.0
+  in
+
+  let rec watch_files last_mtimes =
+    let open Lwt.Syntax in
+    let* () = Lwt_unix.sleep check_interval in
+    let current_mtimes = get_mtimes () in
+    if current_mtimes <> last_mtimes then (
+      Logs.app (fun m -> m "Parquet files changed, reloading...");
+      (try
+        reg_ref := Registry.create ~stores;
+        Logs.app (fun m -> m "Reload complete: %s"
+          (Registry.store_names !reg_ref |> String.concat ", "))
+      with exn ->
+        Logs.err (fun m -> m "Reload failed: %s (keeping old data)" (Printexc.to_string exn)));
+      watch_files current_mtimes)
+    else
+      watch_files last_mtimes
+  in
+
+  let callback = make_callback ~base_url reg_ref store_configs in
+  Lwt_main.run (
+    Lwt.join [
+      Cohttp_lwt_unix.Server.create ~mode:(`TCP (`Port port))
+        (Cohttp_lwt_unix.Server.make ~callback ());
+      watch_files (get_mtimes ());
+    ])

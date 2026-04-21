@@ -300,14 +300,6 @@ let () =
   Logs.app (fun m -> m "Base URL: %s" base_url);
   Logs.app (fun m -> m "Stores: %s" (Registry.store_names !reg_ref |> String.concat ", "));
 
-  let get_mtimes () =
-    List.filter_map
-      (fun (_, path) ->
-        try Some (path, (Unix.stat path).Unix.st_mtime)
-        with Unix.Unix_error _ -> None)
-      stores
-  in
-
   let check_interval =
     Sys.getenv_opt "RELOAD_INTERVAL" |> Option.map float_of_string_opt
     |> Option.join |> Option.value ~default:10.0
@@ -316,6 +308,17 @@ let () =
   Eio_main.run @@ fun env ->
   let net = Eio.Stdenv.net env in
   let clock = Eio.Stdenv.clock env in
+  let fs = Eio.Stdenv.fs env in
+
+  let get_mtimes () =
+    List.filter_map
+      (fun (_, path) ->
+        try
+          let stat = Eio.Path.stat ~follow:true Eio.Path.(fs / path) in
+          Some (path, stat.mtime)
+        with Eio.Io _ -> None)
+      stores
+  in
 
   let server =
     Cohttp_eio.Server.make

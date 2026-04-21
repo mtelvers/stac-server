@@ -7,51 +7,37 @@ let setup_logging () =
 
 let get_param uri name = Uri.get_query_param uri name
 
-let get_float_param uri name ~default =
-  get_param uri name |> Option.map float_of_string_opt |> Option.join
-  |> Option.value ~default
-
 let get_int_param uri name ~default =
   get_param uri name |> Option.map int_of_string_opt |> Option.join
   |> Option.value ~default
 
-let json_headers =
+let cors_headers content_type =
   Cohttp.Header.of_list
     [
-      ("Content-Type", "application/json");
+      ("Content-Type", content_type);
       ("Access-Control-Allow-Origin", "*");
       ("Access-Control-Allow-Methods", "GET, OPTIONS");
       ("Access-Control-Allow-Headers", "*");
     ]
 
-let geojson_headers =
-  Cohttp.Header.of_list
-    [
-      ("Content-Type", "application/geo+json");
-      ("Access-Control-Allow-Origin", "*");
-      ("Access-Control-Allow-Methods", "GET, OPTIONS");
-      ("Access-Control-Allow-Headers", "*");
-    ]
+let respond ~status ?(content_type = "application/json") body =
+  Cohttp_eio.Server.respond_string ~status ~headers:(cors_headers content_type) ~body ()
 
 let respond_json json =
-  let body = Yojson.Safe.to_string json in
-  Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers:json_headers ~body ()
+  respond ~status:`OK (Yojson.Safe.to_string json)
 
 let respond_geojson json =
-  let body = Yojson.Safe.to_string json in
-  Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers:geojson_headers ~body ()
+  respond ~status:`OK ~content_type:"application/geo+json" (Yojson.Safe.to_string json)
 
 let respond_not_found msg =
-  let body = Yojson.Safe.to_string (`Assoc [ ("code", `String "NotFound"); ("description", `String msg) ]) in
-  Cohttp_lwt_unix.Server.respond_string ~status:`Not_found ~headers:json_headers ~body ()
+  respond ~status:`Not_found
+    (Yojson.Safe.to_string (`Assoc [ ("code", `String "NotFound"); ("description", `String msg) ]))
 
-let respond_options () =
-  Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers:json_headers ~body:"" ()
+let respond_options () = respond ~status:`OK ""
 
 let respond_method_not_allowed () =
-  Cohttp_lwt_unix.Server.respond_string ~status:`Method_not_allowed ~body:"Method not allowed" ()
+  respond ~status:`Method_not_allowed "Method not allowed"
 
-(* Parse path segments: "/collections/geotessera-2024/items/grid_1.0_2.0" *)
 let split_path path =
   String.split_on_char '/' path |> List.filter (fun s -> s <> "")
 
@@ -60,17 +46,50 @@ let handle_landing ~base_url =
 
 let handle_conformance () = Stac_json.conformance |> respond_json
 
+let tile_count_for_year reg year =
+  Array.to_seq reg.Registry.tiles
+  |> Seq.filter (fun (t : Registry.tile) -> t.year = year)
+  |> Seq.fold_left (fun acc _ -> acc + 1) 0
+
+let parse_bbox uri =
+  match get_param uri "bbox" with
+  | Some bbox_str -> (
+      match String.split_on_char ',' bbox_str |> List.filter_map float_of_string_opt with
+      | [ a; b; c; d ] -> (a, b, c, d)
+      | _ -> (-180., -90., 180., 90.))
+  | None -> (-180., -90., 180., 90.)
+
+let year_of_collection_id collection_id =
+  match String.split_on_char '-' collection_id with
+  | _ :: year_s :: _ -> int_of_string_opt year_s
+  | _ -> None
+
+let search_tiles ~base_url reg store_configs ~year ~minx ~miny ~maxx ~maxy ~limit ~offset =
+  let matching_tiles =
+    Registry.tiles_in_bbox reg ~year ~minx ~miny ~maxx ~maxy |> Array.of_seq
+  in
+  let matched = Array.length matching_tiles in
+  let page = Array.sub matching_tiles (min offset matched) (min limit (max 0 (matched - offset))) in
+  let items =
+    Array.to_list page
+    |> List.map (fun tile ->
+           let stores = Registry.stores_for_tile reg tile.Registry.id in
+           Stac_json.item ~base_url ~tile ~stores ~store_configs)
+  in
+  let next_token =
+    if offset + limit < matched then Some (string_of_int (offset + limit)) else None
+  in
+  Stac_json.item_collection ~items ~matched ~returned:(List.length items) ~next_token
+  |> respond_geojson
+
 let handle_bitmap reg uri =
   let year = get_int_param uri "year" ~default:0 in
-  (* 3600 x 1800 grid at 0.1-degree resolution, bitpacked *)
   let width = 3600 and height = 1800 in
   let row_bytes = (width + 7) / 8 in
   let buf = Bytes.make (row_bytes * height) '\000' in
   Array.iter
     (fun (t : Registry.tile) ->
       if year = 0 || t.year = year then (
-        (* Coords are tile centres, e.g. -69.45. SW corner = centre - 0.05.
-           Grid: col 0 = lon -180..-179.9, row 0 = lat 89.9..90 *)
         let x = int_of_float (Float.round ((t.lon -. 0.05 +. 180.0) /. 0.1)) in
         let y = int_of_float (Float.round ((90.0 -. (t.lat -. 0.05) -. 0.1) /. 0.1)) in
         if x >= 0 && x < width && y >= 0 && y < height then (
@@ -89,14 +108,10 @@ let handle_bitmap reg uri =
       ("Cache-Control", "public, max-age=300");
     ]
   in
-  Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers
+  Cohttp_eio.Server.respond_string ~status:`OK ~headers
     ~body:(Bytes.to_string buf) ()
 
 let handle_coverage reg store_configs _uri =
-  (* Aggregate across all years by the tile's exact SW corner (lon,lat). Emits
-     one 9-byte record per cell where some store is missing the tile in at
-     least one year: i32 lon_mdeg LE, i32 lat_mdeg LE, u8 fully_replicated_count.
-     Coordinates point at the cell centre (SW + 0.05°). *)
   let store_names = List.map fst store_configs in
   let num_stores = List.length store_names in
   let store_tables =
@@ -106,7 +121,6 @@ let handle_coverage reg store_configs _uri =
         |> Option.value ~default:(Hashtbl.create 0))
       store_names
   in
-  (* Key each cell by SW corner expressed as microdegrees to avoid float hashing. *)
   let cells : (int * int, int array) Hashtbl.t =
     Hashtbl.create (1 lsl 20)
   in
@@ -128,25 +142,25 @@ let handle_coverage reg store_configs _uri =
         store_tables)
     reg.Registry.tiles;
   let buf = Buffer.create (1 lsl 16) in
-  let total_cells = ref 0 in
-  let anomaly_cells = ref 0 in
-  Hashtbl.iter
-    (fun (lon_k, lat_k) counts ->
-      incr total_cells;
-      let total = counts.(0) in
-      let fully = ref 0 in
-      for i = 1 to num_stores do
-        if counts.(i) = total then incr fully
-      done;
-      if !fully < num_stores then begin
-        incr anomaly_cells;
-        let center_lon_mdeg = lon_k + 50_000 in
-        let center_lat_mdeg = lat_k + 50_000 in
-        Buffer.add_int32_le buf (Int32.of_int center_lon_mdeg);
-        Buffer.add_int32_le buf (Int32.of_int center_lat_mdeg);
-        Buffer.add_char buf (Char.chr !fully)
-      end)
-    cells;
+  let total_cells, anomaly_cells =
+    Hashtbl.fold
+      (fun (lon_k, lat_k) counts (total, anomalies) ->
+        let tile_total = counts.(0) in
+        let fully_replicated =
+          let rec count i acc =
+            if i > num_stores then acc
+            else count (i + 1) (if counts.(i) = tile_total then acc + 1 else acc)
+          in
+          count 1 0
+        in
+        if fully_replicated < num_stores then (
+          Buffer.add_int32_le buf (Int32.of_int (lon_k + 50_000));
+          Buffer.add_int32_le buf (Int32.of_int (lat_k + 50_000));
+          Buffer.add_char buf (Char.chr fully_replicated);
+          (total + 1, anomalies + 1))
+        else (total + 1, anomalies))
+      cells (0, 0)
+  in
   let headers =
     Cohttp.Header.of_list
       [
@@ -156,80 +170,34 @@ let handle_coverage reg store_configs _uri =
          "X-Total-Stores,X-Cell-Size-Deg,X-Total-Cells,X-Anomaly-Cells");
         ("X-Total-Stores", string_of_int num_stores);
         ("X-Cell-Size-Deg", "0.1");
-        ("X-Total-Cells", string_of_int !total_cells);
-        ("X-Anomaly-Cells", string_of_int !anomaly_cells);
+        ("X-Total-Cells", string_of_int total_cells);
+        ("X-Anomaly-Cells", string_of_int anomaly_cells);
         ("Cache-Control", "public, max-age=60");
       ]
   in
-  Cohttp_lwt_unix.Server.respond_string ~status:`OK ~headers
+  Cohttp_eio.Server.respond_string ~status:`OK ~headers
     ~body:(Buffer.contents buf) ()
 
 let handle_collections ~base_url reg store_configs =
-  let years = reg.Registry.years in
   let store_names = List.map fst store_configs in
-  let tile_counts =
-    List.map
-      (fun year ->
-        Array.to_seq reg.Registry.tiles
-        |> Seq.filter (fun (t : Registry.tile) -> t.year = year)
-        |> Seq.fold_left (fun acc _ -> acc + 1) 0)
-      years
-  in
-  Stac_json.collections_response ~base_url ~years ~tile_counts ~store_names |> respond_json
+  let tile_counts = List.map (tile_count_for_year reg) reg.Registry.years in
+  Stac_json.collections_response ~base_url ~years:reg.years ~tile_counts ~store_names |> respond_json
 
 let handle_collection ~base_url reg store_configs collection_id =
-  (* collection_id is like "geotessera-2024" *)
-  match String.split_on_char '-' collection_id with
-  | _ :: year_s :: _ -> (
-      match int_of_string_opt year_s with
-      | Some year when List.mem year reg.Registry.years ->
-          let tile_count =
-            Array.to_seq reg.Registry.tiles
-            |> Seq.filter (fun (t : Registry.tile) -> t.year = year)
-            |> Seq.fold_left (fun acc _ -> acc + 1) 0
-          in
-          let store_names = List.map fst store_configs in
-          Stac_json.collection ~base_url ~year ~tile_count ~store_names |> respond_json
-      | _ -> respond_not_found ("Collection not found: " ^ collection_id))
+  match year_of_collection_id collection_id with
+  | Some year when List.mem year reg.Registry.years ->
+      let store_names = List.map fst store_configs in
+      Stac_json.collection ~base_url ~year ~tile_count:(tile_count_for_year reg year) ~store_names
+      |> respond_json
   | _ -> respond_not_found ("Collection not found: " ^ collection_id)
 
 let handle_items ~base_url reg store_configs uri collection_id =
-  match String.split_on_char '-' collection_id with
-  | _ :: year_s :: _ -> (
-      match int_of_string_opt year_s with
-      | Some year when List.mem year reg.Registry.years ->
-          let minx = get_float_param uri "bbox[0]" ~default:(-180.) in
-          let miny = get_float_param uri "bbox[1]" ~default:(-90.) in
-          let maxx = get_float_param uri "bbox[2]" ~default:180. in
-          let maxy = get_float_param uri "bbox[3]" ~default:90. in
-          (* Also support comma-separated bbox parameter *)
-          let minx, miny, maxx, maxy =
-            match get_param uri "bbox" with
-            | Some bbox_str -> (
-                match String.split_on_char ',' bbox_str |> List.filter_map float_of_string_opt with
-                | [ a; b; c; d ] -> (a, b, c, d)
-                | _ -> (minx, miny, maxx, maxy))
-            | None -> (minx, miny, maxx, maxy)
-          in
-          let limit = get_int_param uri "limit" ~default:1000 in
-          let offset = get_int_param uri "offset" ~default:0 in
-          let matching_tiles =
-            Registry.tiles_in_bbox reg ~year ~minx ~miny ~maxx ~maxy |> Array.of_seq
-          in
-          let matched = Array.length matching_tiles in
-          let page = Array.sub matching_tiles (min offset matched) (min limit (max 0 (matched - offset))) in
-          let items =
-            Array.to_list page
-            |> List.map (fun tile ->
-                   let stores = Registry.stores_for_tile reg tile.Registry.id in
-                   Stac_json.item ~base_url ~tile ~stores ~store_configs)
-          in
-          let next_token =
-            if offset + limit < matched then Some (string_of_int (offset + limit)) else None
-          in
-          Stac_json.item_collection ~items ~matched ~returned:(List.length items) ~next_token
-          |> respond_geojson
-      | _ -> respond_not_found ("Collection not found: " ^ collection_id))
+  match year_of_collection_id collection_id with
+  | Some year when List.mem year reg.Registry.years ->
+      let minx, miny, maxx, maxy = parse_bbox uri in
+      let limit = get_int_param uri "limit" ~default:1000 in
+      let offset = get_int_param uri "offset" ~default:0 in
+      search_tiles ~base_url reg store_configs ~year ~minx ~miny ~maxx ~maxy ~limit ~offset
   | _ -> respond_not_found ("Collection not found: " ^ collection_id)
 
 let handle_item ~base_url reg store_configs collection_id item_id =
@@ -244,60 +212,29 @@ let handle_item ~base_url reg store_configs collection_id item_id =
         Stac_json.item ~base_url ~tile ~stores ~store_configs |> respond_geojson
 
 let handle_search ~base_url reg store_configs uri =
-  let minx, miny, maxx, maxy =
-    match get_param uri "bbox" with
-    | Some bbox_str -> (
-        match String.split_on_char ',' bbox_str |> List.filter_map float_of_string_opt with
-        | [ a; b; c; d ] -> (a, b, c, d)
-        | _ -> (-180., -90., 180., 90.))
-    | None -> (-180., -90., 180., 90.)
-  in
+  let minx, miny, maxx, maxy = parse_bbox uri in
   let limit = get_int_param uri "limit" ~default:1000 in
   let offset = get_int_param uri "offset" ~default:0 in
   let year =
     match get_param uri "datetime" with
-    | Some dt -> (
-        match String.split_on_char '-' dt with
-        | y :: _ -> int_of_string_opt y |> Option.value ~default:2024
-        | _ -> 2024)
-    | None ->
-        get_int_param uri "year" ~default:2024
-  in
-  let collections_filter =
-    match get_param uri "collections" with
-    | Some c -> String.split_on_char ',' c
-    | None -> []
+    | Some dt ->
+        String.split_on_char '-' dt
+        |> List.hd |> int_of_string_opt
+        |> Option.value ~default:2024
+    | None -> get_int_param uri "year" ~default:2024
   in
   let year_matches =
-    if collections_filter = [] then true
-    else
-      List.exists
-        (fun cid ->
-          match String.split_on_char '-' cid with
-          | _ :: ys :: _ -> int_of_string_opt ys = Some year
-          | _ -> false)
-        collections_filter
+    match get_param uri "collections" with
+    | None | Some "" -> true
+    | Some c ->
+        String.split_on_char ',' c
+        |> List.exists (fun cid -> year_of_collection_id cid = Some year)
   in
   if not year_matches then
     Stac_json.item_collection ~items:[] ~matched:0 ~returned:0 ~next_token:None
     |> respond_geojson
   else
-    let matching_tiles =
-      Registry.tiles_in_bbox reg ~year ~minx ~miny ~maxx ~maxy |> Array.of_seq
-    in
-    let matched = Array.length matching_tiles in
-    let page = Array.sub matching_tiles (min offset matched) (min limit (max 0 (matched - offset))) in
-    let items =
-      Array.to_list page
-      |> List.map (fun tile ->
-             let stores = Registry.stores_for_tile reg tile.Registry.id in
-             Stac_json.item ~base_url ~tile ~stores ~store_configs)
-    in
-    let next_token =
-      if offset + limit < matched then Some (string_of_int (offset + limit)) else None
-    in
-    Stac_json.item_collection ~items ~matched ~returned:(List.length items) ~next_token
-    |> respond_geojson
+    search_tiles ~base_url reg store_configs ~year ~minx ~miny ~maxx ~maxy ~limit ~offset
 
 let route ~base_url reg store_configs uri =
   let path = Uri.path uri in
@@ -325,7 +262,6 @@ let make_callback ~base_url reg_ref store_configs _conn req _body =
   | _ -> respond_method_not_allowed ()
 
 let parse_store_configs () =
-  (* Parse STORES env var: "name=url,name2=url2" *)
   match Sys.getenv_opt "STORES" with
   | None | Some "" -> []
   | Some stores_str ->
@@ -350,7 +286,6 @@ let () =
     Sys.getenv_opt "BASE_URL" |> Option.value ~default:("http://localhost:" ^ string_of_int port)
   in
 
-  (* Parse store configs from STORES env var *)
   let store_configs = parse_store_configs () in
   if store_configs = [] then (
     Logs.err (fun m -> m "STORES env var is required (e.g. STORES=okavango=url;s3=url)");
@@ -378,27 +313,39 @@ let () =
     |> Option.join |> Option.value ~default:10.0
   in
 
-  let rec watch_files last_mtimes =
-    let open Lwt.Syntax in
-    let* () = Lwt_unix.sleep check_interval in
-    let current_mtimes = get_mtimes () in
-    if current_mtimes <> last_mtimes then (
-      Logs.app (fun m -> m "Parquet files changed, reloading...");
-      (try
-        reg_ref := Registry.create ~stores;
-        Logs.app (fun m -> m "Reload complete: %s"
-          (Registry.store_names !reg_ref |> String.concat ", "))
-      with exn ->
-        Logs.err (fun m -> m "Reload failed: %s (keeping old data)" (Printexc.to_string exn)));
-      watch_files current_mtimes)
-    else
-      watch_files last_mtimes
+  Eio_main.run @@ fun env ->
+  let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
+
+  let server =
+    Cohttp_eio.Server.make
+      ~callback:(make_callback ~base_url reg_ref store_configs) ()
   in
 
-  let callback = make_callback ~base_url reg_ref store_configs in
-  Lwt_main.run (
-    Lwt.join [
-      Cohttp_lwt_unix.Server.create ~mode:(`TCP (`Port port))
-        (Cohttp_lwt_unix.Server.make ~callback ());
-      watch_files (get_mtimes ());
-    ])
+  let watch_files () =
+    let last_mtimes = ref (get_mtimes ()) in
+    while true do
+      Eio.Time.sleep clock check_interval;
+      let current_mtimes = get_mtimes () in
+      if current_mtimes <> !last_mtimes then (
+        Logs.app (fun m -> m "Parquet files changed, reloading...");
+        (try
+          reg_ref := Registry.create ~stores;
+          Logs.app (fun m -> m "Reload complete: %s"
+            (Registry.store_names !reg_ref |> String.concat ", "))
+        with exn ->
+          Logs.err (fun m -> m "Reload failed: %s (keeping old data)" (Printexc.to_string exn)));
+        last_mtimes := current_mtimes)
+    done
+  in
+
+  Eio.Switch.run @@ fun sw ->
+  let socket =
+    Eio.Net.listen net ~sw ~backlog:128 ~reuse_addr:true
+      (`Tcp (Eio.Net.Ipaddr.V4.any, port))
+  in
+  Eio.Fiber.both
+    (fun () ->
+      Cohttp_eio.Server.run socket server
+        ~on_error:(fun exn -> Logs.err (fun m -> m "Server error: %s" (Printexc.to_string exn))))
+    watch_files

@@ -5,9 +5,9 @@ depends: [
   "ocaml" {>= "5.1.0"}
   "dune" {>= "3.0"}
   "arrow"
-  "cohttp-lwt-unix"
+  "cohttp-eio"
+  "eio_main"
   "yojson"
-  "lwt"
   "logs"
   "fmt"
   "odoc" {with-doc}

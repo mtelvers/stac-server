@@ -1,3 +1,3 @@
 (executables
  (names server sync)
- (libraries stac_lib cohttp-lwt-unix lwt lwt.unix logs logs.fmt fmt fmt.tty))
+ (libraries stac_lib cohttp-eio eio_main logs logs.fmt fmt fmt.tty))

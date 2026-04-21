@@ -10,8 +10,8 @@
   (ocaml (>= 5.1.0))
   dune
   arrow
-  cohttp-lwt-unix
+  cohttp-eio
+  eio_main
   yojson
-  lwt
   logs
   fmt))
